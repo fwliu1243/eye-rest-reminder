@@ -1,0 +1,7 @@
+# 运行时生成的文件
+eye_rest_state.json
+eye_rest_config.json
+
+# Python
+__pycache__/
+*.pyc
