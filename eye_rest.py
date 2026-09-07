@@ -128,11 +128,14 @@ class ReminderApi:
         except: pass
 
 next_ts = next_reminder_ts()
+# Keep the state file truthful from the start; it is only rewritten when the
+# schedule actually changes, so a stale value would mislead any diagnosis.
+write_state(next_ts)
 _reminder_api = ReminderApi()
 _done = threading.Event()
 _break_end = threading.Event()
 _break_started = threading.Event()
-_state = {'next_ts': next_ts, 'alive': True}
+_state = {'next_ts': next_ts, 'alive': True, 'user_hidden': False}
 
 SHOW_CMD = b'SHOW'
 
@@ -218,6 +221,110 @@ def _show_window(hwnd, flags):
     except Exception:
         pass
 
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [('cbSize', ctypes.wintypes.DWORD),
+                ('rcMonitor', ctypes.wintypes.RECT),
+                ('rcWork', ctypes.wintypes.RECT),
+                ('dwFlags', ctypes.wintypes.DWORD)]
+
+SWP_NOSIZE = 0x0001
+SWP_NOZORDER = 0x0004
+SWP_SHOWWINDOW = 0x0040
+MONITOR_DEFAULTTONEAREST = 2
+OFFSCREEN_MARGIN = 40
+
+def _window_rect(hwnd):
+    try:
+        u32 = ctypes.windll.user32
+        u32.GetWindowRect.argtypes = [ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.RECT)]
+        u32.GetWindowRect.restype = ctypes.wintypes.BOOL
+        r = ctypes.wintypes.RECT()
+        if u32.GetWindowRect(hwnd, ctypes.byref(r)):
+            return r
+    except Exception:
+        pass
+    return None
+
+def _virtual_screen():
+    # Bounds covering every monitor, in physical pixels.
+    try:
+        u32 = ctypes.windll.user32
+        x, y = u32.GetSystemMetrics(76), u32.GetSystemMetrics(77)
+        w, h = u32.GetSystemMetrics(78), u32.GetSystemMetrics(79)
+        if w > 0 and h > 0:
+            return x, y, x + w, y + h
+    except Exception:
+        pass
+    return 0, 0, 1920, 1080
+
+def _work_area(hwnd):
+    # Work area (screen minus taskbar) of the monitor nearest to hwnd.
+    try:
+        u32 = ctypes.windll.user32
+        u32.MonitorFromWindow.restype = ctypes.c_void_p
+        u32.MonitorFromWindow.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.DWORD]
+        u32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
+        mon = u32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(_MONITORINFO)
+        if mon and u32.GetMonitorInfoW(mon, ctypes.byref(info)):
+            a = info.rcWork
+            if a.right > a.left and a.bottom > a.top:
+                return a.left, a.top, a.right, a.bottom
+    except Exception:
+        pass
+    return _virtual_screen()
+
+def window_off_screen(hwnd):
+    # A hidden WinForms window is parked far outside the desktop at
+    # (-32000,-32000), and resize() keeps whatever location the window already
+    # has, so that parked coordinate gets written into its normal position.
+    # Show() then only makes the window visible off-screen: the reminder stays
+    # invisible and the phase loops wait for a click that can never happen.
+    if not hwnd:
+        return True
+    r = _window_rect(hwnd)
+    if r is None:
+        return False
+    left, top, right, bottom = _virtual_screen()
+    return not (r.right > left + OFFSCREEN_MARGIN and r.left < right - OFFSCREEN_MARGIN and
+                r.bottom > top + OFFSCREEN_MARGIN and r.top < bottom - OFFSCREEN_MARGIN)
+
+def ensure_on_screen(hwnd):
+    # Pull a parked window back to a visible spot on its own monitor.
+    # A window the user closed on purpose stays closed: dragging it back would
+    # undo the close-to-background behaviour, so only re-place windows we are
+    # showing ourselves.
+    if _state.get('user_hidden'):
+        return
+    if not hwnd or not window_off_screen(hwnd):
+        return
+    r = _window_rect(hwnd)
+    if r is None:
+        return
+    w, h = r.right - r.left, r.bottom - r.top
+    left, top, right, bottom = _work_area(hwnd)
+    x = left + max(0, (right - left - w) // 2)
+    y = top + max(0, (bottom - top - h) // 3)
+    try:
+        u32 = ctypes.windll.user32
+        u32.SetWindowPos.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.HWND,
+                                     ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                     ctypes.c_int, ctypes.wintypes.UINT]
+        u32.SetWindowPos.restype = ctypes.wintypes.BOOL
+        u32.SetWindowPos(hwnd, None, x, y, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW)
+    except Exception:
+        pass
+
+def guard_window():
+    # Phase loops can idle for many minutes, and a standby cycle in between
+    # parks the window again, so re-check placement periodically.
+    try:
+        ensure_on_screen(find_hwnd())
+    except Exception:
+        pass
+
 def window_needs_restore(hwnd):
     if not hwnd:
         return True
@@ -225,9 +332,12 @@ def window_needs_restore(hwnd):
         u32 = ctypes.windll.user32
         u32.IsWindowVisible.restype = ctypes.wintypes.BOOL
         u32.IsIconic.restype = ctypes.wintypes.BOOL
-        return (not u32.IsWindowVisible(hwnd)) or bool(u32.IsIconic(hwnd))
+        if (not u32.IsWindowVisible(hwnd)) or bool(u32.IsIconic(hwnd)):
+            return True
     except Exception:
         return True
+    # An off-screen window still reports as visible, so it takes the same path.
+    return window_off_screen(hwnd)
 
 def bring_to_front(win, focus=True):
     # Only touch the window when it is actually hidden or minimised. Resizing or
@@ -236,6 +346,9 @@ def bring_to_front(win, focus=True):
     if not _state['alive'] or not win:
         return
     global _current_mode
+    # Showing on purpose (a reminder firing, or the desktop shortcut) overrides
+    # an earlier user-initiated hide.
+    _state['user_hidden'] = False
     hwnd = find_hwnd()
     if window_needs_restore(hwnd):
         try:
@@ -256,6 +369,9 @@ def bring_to_front(win, focus=True):
             resize_for_mode(win, mode)
         except Exception:
             pass
+    # resize() re-pins whatever location the window had, so a parked window ends
+    # up off-screen again right after being shown. Correct it last.
+    ensure_on_screen(hwnd)
     if hwnd and focus:
         try:
             u32 = ctypes.windll.user32
@@ -270,6 +386,7 @@ def on_closing():
     try:
         if not _state['alive'] or _done.is_set():
             return True
+        _state['user_hidden'] = True
         if webview.windows:
             webview.windows[0].hide()
         return False
@@ -350,14 +467,17 @@ def resize_for_mode(win, mode):
         return
     global _current_mode
     if mode == _current_mode:
+        ensure_on_screen(find_hwnd())
         return
     h = MODE_HEIGHTS.get(mode, 500)
     try:
         win.resize(WINDOW_WIDTH, h)
         _current_mode = mode
     except Exception:
-        return
-    fit_window(win, h)
+        pass
+    else:
+        fit_window(win, h)
+    ensure_on_screen(find_hwnd())
 
 def break_phase(win):
     try:
@@ -369,9 +489,13 @@ def break_phase(win):
         eval_js(win, 'modeReady()')
         resize_for_mode(win, 'ready')
         t0 = time.time() + 1800
+        g0 = time.time()
         while not _break_started.is_set() and not _break_end.is_set() and not _done.is_set() and _state['alive']:
             if time.time() > t0:
                 break
+            if time.time() - g0 > 2:
+                g0 = time.time()
+                guard_window()
             time.sleep(0.1)
         if _done.is_set() or not _state['alive']:
             return
@@ -392,7 +516,11 @@ def break_phase(win):
         eval_js(win, 'modeBreak(' + str(break_sec) + ',0,' + json.dumps(reminder_text) + ')')
         resize_for_mode(win, 'break')
         last_shown = None
+        g1 = time.time()
         while not _break_end.is_set() and not _done.is_set() and _state['alive']:
+            if time.time() - g1 > 2:
+                g1 = time.time()
+                guard_window()
             e = time.time() - b0
             r = max(0, break_sec - e)
             ri = int(math.ceil(r)) if r > 0 else 0

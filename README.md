@@ -12,6 +12,7 @@
 - ⏰ **5 分钟后提醒** — 推迟到下次提醒
 - 🔒 单实例运行，重复启动不新开进程，而是把已有窗口唤回前台
 - 🫥 关闭窗口不退出程序，转入后台继续计时，到点自动浮出
+- 🛡 窗口离屏自动纠偏，睡眠唤醒后提醒依然可见
 - 💧 按钮点击带水波纹反馈
 - 📝 间隔、休息时长、提示文案均可配置
 - 🚀 开机自启（注册表 HKCU Run，无需管理员权限）
@@ -21,14 +22,14 @@
 
 ### 1. 下载
 
-`ash
+```bash
 git clone https://github.com/fwliu1243/eye-rest-reminder.git
 cd eye-rest-reminder
-`
+```
 
 ### 2. 启动（需安装 Python 3 + pywebview）
 
-`powershell
+```powershell
 # 安装依赖
 pip install pywebview
 
@@ -37,11 +38,11 @@ pythonw.exe eye_rest.py
 
 # 测试弹窗
 python eye_rest.py --test
-`
+```
 
 ### 3. 开机自启
 
-`powershell
+```powershell
 # 添加自启（替换路径为实际路径）
 Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" \
   -Name "EyeRestReminder" \
@@ -49,19 +50,19 @@ Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" \
 
 # 取消自启
 Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name EyeRestReminder
-`
+```
 
 ## 配置
 
 首次运行后在同目录生成 eye_rest_config.json：
 
-`json
+```json
 {
   "interval_min": 20,
   "break_sec": 20,
   "text": "该休息眼睛了！\n\n看看远处 20 英尺（约 6 米）以外的物体\n至少 20 秒，让睫状肌放松\n\n（20-20-20 法则）"
 }
-`
+```
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
@@ -84,10 +85,18 @@ Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name 
 ## 工作原理
 
 - **计时基准**：使用 GetTickCount64() 获取系统开机时刻，提醒节点 = 开机时刻 + N × 间隔
-- **轮询检查**：每 10 秒检查一次是否到达节点，到达即弹出窗口
+- **轮询检查**：每 1 秒检查一次是否到达节点，到达即弹出窗口
+- **离屏纠偏**：Windows 隐藏窗口时会把它停放到屏幕外的 `(-32000,-32000)`，
+  而 pywebview 的 `resize()` 会沿用窗口当前坐标，导致该停放坐标被写死成
+  「正常位置」——此后 `Show()` 只能让窗口在屏幕外可见，提醒永久看不见。
+  `window_off_screen()` 以虚拟屏幕边界判定离屏，`ensure_on_screen()` 用
+  `SetWindowPos` 把窗口搬回就近显示器工作区（尺寸不变）。用户主动关闭的窗口
+  由 `user_hidden` 标记保护，守护不会把它强行拽回
 - **单实例**：通过本地端口（28940）绑定检测；重复启动时向已运行实例发送
   `SHOW` 指令，由其把窗口从隐藏/最小化状态还原到前台，随后立即退出
 - **关闭窗口**：拦截 `closing` 事件，只隐藏窗口不退出进程；到点提醒时会自动重新浮出
+- **阶段循环守护**：Ready 阶段最长空转 30 分钟，期间若发生睡眠唤醒窗口会被再次
+  停放，故两个阶段循环每 2 秒复检一次窗口位置
 - **窗口高度自适应**：`MODE_HEIGHTS` 给的是整窗高度，页面却只拿得到客户区高度
   （差值约 39px 标题栏），卡片被 `overflow:hidden` 裁掉后底部按钮点不到。
   现在渲染后实测卡片高度并补偿 chrome，同时限制在屏幕高度内
@@ -101,11 +110,12 @@ Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name 
 
 ## 目录结构
 
-`
+```
 eye_rest.py            # 主程序（Python + pywebview + HTML/CSS）
 eye_rest_config.json   # 用户配置（可选，缺省时使用内置默认值）
 eye_rest_state.json    # 运行时状态（下次提醒时间）
-`
+MAINTENANCE.md         # 维护记录（缺陷根因与修复验证）
+```
 
 ## 技术栈
 
